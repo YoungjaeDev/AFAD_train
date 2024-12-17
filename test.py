@@ -1,5 +1,7 @@
 import os
 import torch
+from glob import glob
+from tqdm import tqdm
 import yaml
 from PIL import Image
 from torchvision import transforms
@@ -30,13 +32,13 @@ def inference_single_image(model, image_path, device, transform):
         predicted_gender = torch.argmax(gender_probs, dim=1).item()  # 0=남, 1=여
     return predicted_age, predicted_gender
 
-def main():
-    config = load_config('config.yaml')
+def main(config_path='config.yaml'):
+    config = load_config(config_path)
     model_name = config['model']['name']
     image_size = config['dataset']['image_size']
+    test_image_dir = config['test']['image_dir']
+    checkpoint_path = config['checkpoint']['path']
     
-    # 추론에 사용할 체크포인트 경로
-    checkpoint_path = './checkpoints/best_model_epoch_1.pth'  # 실제 위치로 수정
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 모델 생성 및 로드
@@ -47,12 +49,11 @@ def main():
     # Transform
     transform = get_inference_transform(image_size)
     
-    # 예시: 단일 이미지 추론
-    test_image_path = '/path/to/test.jpg'  # 실제 테스트할 이미지 경로
-    predicted_age, predicted_gender = inference_single_image(model, test_image_path, device, transform)
-    
-    gender_str = 'Male' if predicted_gender == 0 else 'Female'
-    print(f"Inference result - Age: {predicted_age:.2f}, Gender: {gender_str}")
+    for image_path in tqdm(glob(os.path.join(test_image_dir, '*.*'))):
+        predicted_age, predicted_gender = inference_single_image(model, image_path, device, transform)
+        
+        gender_str = 'Male' if predicted_gender == 0 else 'Female'
+        print(f"Inference result - {image_path} Age: {predicted_age:.2f}, Gender: {gender_str}")
 
 if __name__ == '__main__':
-    main()
+    main('config.yaml')
