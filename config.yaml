@@ -18,3 +18,6 @@ logging:
   run_name: "convnext_tiny_multitask"
 checkpoint:
   path: "checkpoints/best_model_epoch_8.pth"  # 실제 체크포인트 경로로 수정 필요
+
+test:
+  image_dir: 'test_images/111/30'
