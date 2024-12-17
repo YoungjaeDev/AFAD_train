@@ -102,6 +102,11 @@ scheduler = optim.lr_scheduler.OneCycleLR(
 )
 ```
 
+## 학습결과
+
+![image](assets/history.png)
+
+
 ## 주의사항
 - GPU 메모리 사용량에 따라 batch_size 조정 필요
 - wandb 사용 시 로그인 필요
