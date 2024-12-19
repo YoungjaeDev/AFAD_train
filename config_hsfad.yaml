@@ -1,0 +1,25 @@
+model:
+  name: convnextv2_base        # timm에서 불러올 모델 이름
+training:
+  epochs: 10            # 전체 epoch 수
+  batch_size: 128        # 배치 크기
+  lr: 1.0e-4              # 학습률
+  weight_decay: 1.0e-5     # weight decay
+  log_interval: 100      # 몇 iteration마다 로그할지
+  save_dir: ./checkpoints  # 모델 저장 경로
+dataset:
+  root_dir: [/mnt/disk3/face_age_gender_estimation/AFAD-Full, /mnt/disk3/face_age_gender_estimation/HS-FAD]  # AFAD 데이터셋 디렉토리
+  name: CombinedAgeDataset
+  image_size: 112        # 입력 이미지 크기
+  val_split: 0.2         # 학습/검증 데이터 분할 비율 (0.2 = 20%를 검증용)
+  balanced_sampler: false  # 균형 샘플러 사용 여부
+logging:
+  use_wandb: true         # wandb 사용 여부
+  project: "AFAD-training"
+  entity: "youngjae-you"      # wandb 개인/팀 이름
+  run_name: "convnext_base_multitask_combined_reg"
+checkpoint:
+  path: "checkpoints/best_model_epoch_10.pth"  # 실제 체크포인트 경로로 수정 필요
+
+test:
+  image_dir: 'test_images/111/30'

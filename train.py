@@ -1,14 +1,41 @@
 import os
 import yaml
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 import wandb
 
-from dataset import AFADDataset
+from dataset import AFADDataset, HS_FADDataset, CombinedAgeDataset
 from model import MultiTaskModel
+
+# DataLoader 생성 부분을 다음과 같이 수정
+def get_balanced_sampler(dataset):
+    """
+    각 나이 클래스에 대한 WeightedRandomSampler를 생성
+    """
+    # 각 샘플의 나이 클래스 수집
+    age_labels = [sample[1] for sample in dataset.samples]  # [1]은 age_class
+    
+    # 각 클래스별 샘플 개수 계산
+    class_counts = np.bincount(age_labels)
+    
+    # 각 클래스의 weight 계산 (적은 샘플을 가진 클래스에 더 높은 가중치)
+    weights = 1. / class_counts
+    
+    # 각 샘플에 대한 weight 할당
+    sample_weights = weights[age_labels]
+    
+    # WeightedRandomSampler 생성
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(dataset),
+        replacement=True
+    )
+    
+    return sampler
 
 def main(config_path='config.yaml'):
     # -------------------
@@ -63,20 +90,57 @@ def main(config_path='config.yaml'):
     # -------------------
     # 4) Dataset & Dataloader
     # -------------------
-    train_dataset = AFADDataset(
-        root_dir=root_dir,
-        transform=train_transform,
-        split='train',
-        val_split=val_split
-    )
-    val_dataset = AFADDataset(
-        root_dir=root_dir,
-        transform=val_transform,
-        split='val',
-        val_split=val_split
-    )
+    dataset_name = cfg['dataset']['name']
+    if dataset_name == 'AFADDataset':
+        train_dataset = AFADDataset(
+            root_dir=root_dir,
+            transform=train_transform,
+            split='train',
+            val_split=val_split
+        )
+        val_dataset = AFADDataset(
+            root_dir=root_dir,
+            transform=val_transform,
+            split='val',
+            val_split=val_split
+        )
+    elif dataset_name == 'HS_FADDataset':
+        train_dataset = HS_FADDataset(
+            root_dir=root_dir,
+            transform=train_transform,
+            split='train',
+            val_split=val_split
+        )
+        val_dataset = HS_FADDataset(
+            root_dir=root_dir,
+            transform=val_transform,
+            split='val',
+            val_split=val_split
+        )
+    elif dataset_name == 'CombinedAgeDataset':
+        train_dataset = CombinedAgeDataset(
+            afad_root_dir=root_dir[0],
+            hsfad_root_dir=root_dir[1],
+            transform=train_transform,
+            split='train',
+            val_split=val_split
+        )
+        val_dataset = CombinedAgeDataset(
+            afad_root_dir=root_dir[0],
+            hsfad_root_dir=root_dir[1],
+            transform=val_transform,
+            split='val',
+            val_split=val_split
+        )
+    else:
+        raise ValueError(f"Invalid dataset name: {dataset_name}")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    if cfg['dataset'].get('balanced_sampler', False):
+        train_sampler = get_balanced_sampler(train_dataset)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
     # -------------------
@@ -88,7 +152,7 @@ def main(config_path='config.yaml'):
     model = torch.nn.DataParallel(model)  # 간단한 GPU 병렬화
     model.to(device)
     
-    # 나이(회귀) -> MSELoss, 성별(분류) -> CrossEntropyLoss
+    # 나이(분류) -> MSE, 성별(분류) -> CrossEntropyLoss
     criterion_age = nn.MSELoss()
     criterion_gender = nn.CrossEntropyLoss()
     
@@ -125,6 +189,15 @@ def main(config_path='config.yaml'):
     # # 다른 스케줄러들
     # scheduler.step()  # epoch 끝날 때
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,      # 학습률을 절반으로 감소
+        patience=2,      # 2 epoch 동안 개선이 없으면 lr 감소
+        min_lr=1e-6,     # 최소 학습률
+        verbose=True     # 학습률 변경 시 출력
+    )
+
     # 저장 폴더 생성
     os.makedirs(save_dir, exist_ok=True)
 
@@ -141,16 +214,20 @@ def main(config_path='config.yaml'):
         for step, (images, age, gender) in enumerate(train_loader):
             images = images.to(device)
             age = age.float().to(device)
-            gender = gender.to(device)
+            gender = gender.long().to(device)
             
             optimizer.zero_grad()
             age_out, gender_out = model(images)
             
-            loss_age = criterion_age(age_out, age)  # 회귀
-            loss_gender = criterion_gender(gender_out, gender)  # 분류
-            loss = loss_age + loss_gender
+            loss_age = criterion_age(age_out, age)
+            loss_gender = criterion_gender(gender_out, gender)
+            # loss = loss_age + loss_gender
+            loss = 10.0 * loss_age + loss_gender
             
             loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             running_loss += loss.item()
@@ -196,6 +273,9 @@ def main(config_path='config.yaml'):
             torch.save(model.module.state_dict(), save_path)
             print(f"Best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
 
+        # epoch 끝날 때마다 scheduler step
+        scheduler.step(val_loss)
+
     # 최종 모델도 저장
     save_final_path = os.path.join(save_dir, f"final_model_epoch_{epochs}.pth")
     torch.save(model.module.state_dict(), save_final_path)
@@ -215,8 +295,8 @@ def validate(model, val_loader, criterion_age, criterion_gender, device):
     with torch.no_grad():
         for images, age, gender in val_loader:
             images = images.to(device)
-            age = age.to(device)
-            gender = gender.to(device)
+            age = age.float().to(device)
+            gender = gender.long().to(device)
             
             age_out, gender_out = model(images)
             
@@ -227,7 +307,7 @@ def validate(model, val_loader, criterion_age, criterion_gender, device):
             val_loss += loss.item()
             val_loss_age += loss_age.item()
             val_loss_gender += loss_gender.item()
-            
+
             # 성별 분류 정확도 계산
             _, predicted_gender = torch.max(gender_out, dim=1)
             correct_gender += (predicted_gender == gender).sum().item()
@@ -242,4 +322,4 @@ def validate(model, val_loader, criterion_age, criterion_gender, device):
         
 
 if __name__ == '__main__':
-    main('config.yaml')
+    main('config_hsfad.yaml')

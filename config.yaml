@@ -11,6 +11,7 @@ dataset:
   root_dir: /mnt/disk3/face_age_gender_estimation/AFAD-Full  # AFAD 데이터셋 디렉토리
   image_size: 112        # 입력 이미지 크기
   val_split: 0.2         # 학습/검증 데이터 분할 비율 (0.2 = 20%를 검증용)
+  balanced_sampler: true  # 균형 샘플러 사용 여부
 logging:
   use_wandb: true         # wandb 사용 여부
   project: "AFAD-training"

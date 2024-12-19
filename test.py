@@ -32,6 +32,10 @@ def inference_single_image(model, image_path, device, transform):
         predicted_gender = torch.argmax(gender_probs, dim=1).item()  # 0=남, 1=여
     return predicted_age, predicted_gender
 
+def denormalize_age(normalized_age):
+    """정규화된 나이값을 원래 스케일로 변환"""
+    return normalized_age * 40.0 + 10
+
 def main(config_path='config.yaml'):
     config = load_config(config_path)
     model_name = config['model']['name']
@@ -51,9 +55,10 @@ def main(config_path='config.yaml'):
     
     for image_path in tqdm(glob(os.path.join(test_image_dir, '*.*'))):
         predicted_age, predicted_gender = inference_single_image(model, image_path, device, transform)
+        predicted_age = denormalize_age(predicted_age)
         
         gender_str = 'Male' if predicted_gender == 0 else 'Female'
         print(f"Inference result - {image_path} Age: {predicted_age:.2f}, Gender: {gender_str}")
 
 if __name__ == '__main__':
-    main('config.yaml')
+    main('config_hsfad.yaml')
