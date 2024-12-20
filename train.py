@@ -10,6 +10,7 @@ import wandb
 
 from dataset import AFADDataset, HS_FADDataset, CombinedAgeDataset
 from model import MultiTaskModel
+from loss import WeightedMSELoss
 
 # DataLoader 생성 부분을 다음과 같이 수정
 def get_balanced_sampler(dataset):
@@ -50,8 +51,8 @@ def main(config_path='config.yaml'):
     lr = cfg['training']['lr']
     weight_decay = cfg['training']['weight_decay']
     log_interval = cfg['training']['log_interval']
-    save_dir = cfg['training']['save_dir']
-
+    age_loss_weight = cfg['training']['age_loss_weight']
+    
     root_dir = cfg['dataset']['root_dir']
     image_size = cfg['dataset']['image_size']
     val_split = cfg['dataset']['val_split']
@@ -61,6 +62,7 @@ def main(config_path='config.yaml'):
     wandb_entity = cfg['logging']['entity']
     run_name = cfg['logging']['run_name']
     
+    save_dir = os.path.join(cfg['training']['save_dir'], run_name)
     # -------------------
     # 2) wandb init
     # -------------------
@@ -153,7 +155,8 @@ def main(config_path='config.yaml'):
     model.to(device)
     
     # 나이(분류) -> MSE, 성별(분류) -> CrossEntropyLoss
-    criterion_age = nn.MSELoss()
+    # criterion_age = nn.MSELoss()
+    criterion_age = WeightedMSELoss()
     criterion_gender = nn.CrossEntropyLoss()
     
     optimizer = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
@@ -208,21 +211,23 @@ def main(config_path='config.yaml'):
     global_step = 0
 
     for epoch in range(epochs):
+        print(f"=== Training Epoch {epoch+1}/{epochs} ===")
         model.train()
         running_loss = 0.0
         
-        for step, (images, age, gender) in enumerate(train_loader):
+        for step, (images, age, gender, weight) in enumerate(train_loader):
             images = images.to(device)
             age = age.float().to(device)
             gender = gender.long().to(device)
+            weight = weight.to(device)
             
             optimizer.zero_grad()
             age_out, gender_out = model(images)
             
-            loss_age = criterion_age(age_out, age)
+            loss_age = criterion_age(age_out, age, weight) * age_loss_weight
             loss_gender = criterion_gender(gender_out, gender)
             # loss = loss_age + loss_gender
-            loss = 10.0 * loss_age + loss_gender
+            loss = loss_age + loss_gender
             
             loss.backward()
             
@@ -235,7 +240,7 @@ def main(config_path='config.yaml'):
             
             if (step + 1) % log_interval == 0:
                 avg_loss = running_loss / log_interval
-                print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Loss: {avg_loss:.4f}")
+                print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Loss: {avg_loss:.4f} | Age Loss: {loss_age.item():.4f} | Gender Loss: {loss_gender.item():.4f}")
                 
                 if use_wandb:
                     wandb.log({
@@ -250,7 +255,7 @@ def main(config_path='config.yaml'):
         # -------------------
         # Validation
         # -------------------
-        val_loss, val_loss_age, val_loss_gender, val_acc_gender = validate(model, val_loader, criterion_age, criterion_gender, device)
+        val_loss, val_loss_age, val_loss_gender, val_acc_gender = validate(model, val_loader, criterion_age, criterion_gender, device, age_loss_weight)
         
         print(f"=== Validation Epoch {epoch+1}/{epochs} ===")
         print(f"Val Loss: {val_loss:.4f} | Age Loss: {val_loss_age:.4f} | Gender Loss: {val_loss_gender:.4f} | Gender Acc: {val_acc_gender:.4f}")
@@ -284,7 +289,7 @@ def main(config_path='config.yaml'):
     if use_wandb:
         wandb.finish()
 
-def validate(model, val_loader, criterion_age, criterion_gender, device):
+def validate(model, val_loader, criterion_age, criterion_gender, device, age_loss_weight):
     model.eval()
     val_loss = 0.0
     val_loss_age = 0.0
@@ -293,14 +298,15 @@ def validate(model, val_loader, criterion_age, criterion_gender, device):
     total_samples = 0
     
     with torch.no_grad():
-        for images, age, gender in val_loader:
+        for images, age, gender, weight in val_loader:
             images = images.to(device)
             age = age.float().to(device)
             gender = gender.long().to(device)
+            weight = weight.to(device)
             
             age_out, gender_out = model(images)
             
-            loss_age = criterion_age(age_out, age)
+            loss_age = criterion_age(age_out, age, weight) * age_loss_weight
             loss_gender = criterion_gender(gender_out, gender)
             loss = loss_age + loss_gender
             

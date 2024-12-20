@@ -5,12 +5,16 @@ gender는 남성: 0, 여성: 1로 매핑했습니다.
 """
 
 import os
+import logging
 import glob
 import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class AFADDataset(Dataset):
     def __init__(self, root_dir, transform=None, split='train', val_split=0.2, seed=42):
@@ -146,10 +150,9 @@ class HS_FADDataset(Dataset):
         # 모든 이미지 경로 수집
         all_image_paths = glob.glob(os.path.join(root_dir, '*', '*', '*.jpg'))
         
-        # 이미지를 그룹으로 묶기
+        # 이미지를 그룹으로 묶기 (같은 인물의 이미지들)
         image_groups = {}
         for img_path in all_image_paths:
-            # 파일명에서 그룹 ID 추출
             filename = os.path.basename(img_path)
             group_id = '_'.join(filename.split('_')[:-1])
             
@@ -159,6 +162,8 @@ class HS_FADDataset(Dataset):
         
         # 각 그룹의 이미지들을 처리
         self.samples = []
+        age_counts = {}  # 나이별 카운트를 위한 딕셔너리
+        
         for group_paths in image_groups.values():
             group_samples = []
             for img_path in group_paths:
@@ -166,21 +171,31 @@ class HS_FADDataset(Dataset):
                 age = int(parts[-3])
                 gender_str = parts[-2]
                 
-                # 나이를 0-1 사이로 정규화 (10-50세 범위 기준)
-                normalized_age = (float(age) - 10) / 40.0
+                # 나이 카운트 업데이트
+                if age not in age_counts:
+                    age_counts[age] = 0
+                age_counts[age] += 1
                 
-                gender = 0 if gender_str == '111' else 1  # 남성=0, 여성=1
-                group_samples.append((img_path, normalized_age, gender))
+                gender = 0 if gender_str == '111' else 1
+                group_samples.append((img_path, age, gender))
             
             self.samples.append(group_samples)
+        
+        # 나이별 가중치 계산 (샘플 수의 역수를 기반으로)
+        max_count = max(age_counts.values())
+        self.age_weights = {
+            age: max_count / count 
+            for age, count in age_counts.items()
+        }
+        
+        logger.info(f"Age weights: {self.age_weights}")
         
         # 그룹 단위로 셔플
         random.seed(seed)
         random.shuffle(self.samples)
         
-        # 그룹 단위로 train/val 분할
+        # train/val 분할
         val_size = int(len(self.samples) * val_split)
-        
         if split == 'train':
             self.samples = self.samples[val_size:]
         else:  # 'val'
@@ -199,22 +214,38 @@ class HS_FADDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         
-        # age는 이미 정규화된 float 값, gender는 정수
-        return image, age, gender
+        # 가중치가 적용된 정규화된 나이
+        normalized_age = (float(age) - 10) / 40.0
+        
+        # 가중치는 loss 계산을 위해 함께 반환
+        weight = self.age_weights[age]
+        
+        return image, normalized_age, gender, weight
 
     @staticmethod
-    def denormalize_age(normalized_age):
-        """정규화된 나이값을 원래 스케일로 변환"""
+    def denormalize_age(weighted_age, age_weight):
+        """가중치가 적용된 나이값을 원래 스케일로 변환"""
+        normalized_age = weighted_age / age_weight
         return normalized_age * 40.0 + 10
     
     
 class CombinedAgeDataset(Dataset):
-    def __init__(self, afad_root_dir, hsfad_root_dir, transform=None, split='train', val_split=0.2, seed=42):
+    def __init__(self, afad_root_dir, hsfad_root_dir, transform=None, split='train', val_split=0.2, seed=42, 
+                 max_samples_per_age={
+                     10: 10000,
+                     20: 10000,
+                     30: 10000,
+                     40: -1,
+                     50: -1
+                 }):
         self.transform = transform
         self.samples = []
         
         # AFAD 데이터 처리
         if afad_root_dir:
+            # 나이대별로 이미지를 분류
+            age_grouped_samples = {10: [], 20: [], 30: [], 40: [], 50: []}
+            
             afad_images = glob.glob(os.path.join(afad_root_dir, '*', '*', '*.jpg'))
             for img_path in afad_images:
                 parts = img_path.split(os.sep)
@@ -234,13 +265,34 @@ class CombinedAgeDataset(Dataset):
                     normalized_age = 50
                 
                 gender = 0 if gender_str == '111' else 1
-                self.samples.append((img_path, normalized_age, gender, 'afad'))
-        
-        # HS-FAD 데이터 처리
+                age_grouped_samples[normalized_age].append((img_path, normalized_age, gender, 'afad'))
+            
+            # 각 나이대별로 처리
+            for age_group in age_grouped_samples:
+                samples = age_grouped_samples[age_group]
+                random.shuffle(samples)  # 랜덤하게 섞기
+                
+                # 최대 샘플 수 적용
+                if max_samples_per_age[age_group] != -1:
+                    samples = samples[:max_samples_per_age[age_group]]
+                
+                # 각 나이대별로 train/val 분할
+                val_size = int(len(samples) * val_split)
+                if split == 'train':
+                    selected_samples = samples[val_size:]
+                else:  # 'val'
+                    selected_samples = samples[:val_size]
+                
+                self.samples.extend(selected_samples)
+
+        # HS-FAD 데이터 처리 (비슷한 방식으로 수정)
         if hsfad_root_dir:
             hsfad_images = glob.glob(os.path.join(hsfad_root_dir, '*', '*', '*.jpg'))
             
-            # 이미지를 그룹으로 묶기 (HS-FAD 특성)
+            # 나이대별로 그룹화
+            age_grouped_samples = {10: [], 20: [], 30: [], 40: [], 50: []}
+            
+            # 이미지를 그룹으로 묶기
             image_groups = {}
             for img_path in hsfad_images:
                 filename = os.path.basename(img_path)
@@ -250,50 +302,35 @@ class CombinedAgeDataset(Dataset):
                     image_groups[group_id] = []
                 image_groups[group_id].append(img_path)
             
-            # 각 그룹의 이미지들을 처리
+            # 각 그룹의 이미지들을 나이대별로 분류
             for group_paths in image_groups.values():
-                group_samples = []
                 for img_path in group_paths:
                     parts = img_path.split(os.sep)
-                    age = int(parts[-3])  # HS-FAD는 이미 10단위
+                    age = int(parts[-3])
                     gender_str = parts[-2]
                     gender = 0 if gender_str == '111' else 1
-                    group_samples.append((img_path, age, gender, 'hsfad'))
-                self.samples.extend(group_samples)
-        
-        # 전체 데이터 셔플 (HS-FAD의 그룹 특성은 유지)
-        random.seed(seed)
-        if hsfad_root_dir:  # HS-FAD 데이터가 있는 경우
-            # HS-FAD 데이터는 그룹으로 묶어서 셔플
-            hsfad_samples = [s for s in self.samples if s[3] == 'hsfad']
-            afad_samples = [s for s in self.samples if s[3] == 'afad']
+                    age_grouped_samples[age].append((img_path, age, gender, 'hsfad'))
             
-            # HS-FAD 그룹 유지하면서 셔플
-            hsfad_groups = {}
-            for sample in hsfad_samples:
-                group_id = '_'.join(os.path.basename(sample[0]).split('_')[:-1])
-                if group_id not in hsfad_groups:
-                    hsfad_groups[group_id] = []
-                hsfad_groups[group_id].append(sample)
-            
-            hsfad_groups_list = list(hsfad_groups.values())
-            random.shuffle(hsfad_groups_list)
-            hsfad_samples = [sample for group in hsfad_groups_list for sample in group]
-            
-            # AFAD는 개별 셔플
-            random.shuffle(afad_samples)
-            
-            # 데이터 합치기
-            self.samples = afad_samples + hsfad_samples
-        else:
-            random.shuffle(self.samples)
-        
-        # Train/Val 분할
-        val_size = int(len(self.samples) * val_split)
-        if split == 'train':
-            self.samples = self.samples[val_size:]
-        else:  # 'val'
-            self.samples = self.samples[:val_size]
+            # 각 나이대별로 처리
+            for age_group in age_grouped_samples:
+                samples = age_grouped_samples[age_group]
+                random.shuffle(samples)
+                
+                # 최대 샘플 수 적용
+                if max_samples_per_age[age_group] != -1:
+                    samples = samples[:max_samples_per_age[age_group]]
+                
+                # 각 나이대별로 train/val 분할
+                val_size = int(len(samples) * val_split)
+                if split == 'train':
+                    selected_samples = samples[val_size:]
+                else:  # 'val'
+                    selected_samples = samples[:val_size]
+                
+                self.samples.extend(selected_samples)
+
+        # 최종 데이터 셔플
+        random.shuffle(self.samples)
 
     def __len__(self):
         return len(self.samples)
