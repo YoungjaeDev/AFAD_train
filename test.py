@@ -5,7 +5,7 @@ from tqdm import tqdm
 import yaml
 from PIL import Image
 from torchvision import transforms
-from model import MultiTaskModel
+from model import MultiTaskModel, MultiTaskModel_KLD
 
 def load_config(config_path='config.yaml'):
     with open(config_path, 'r') as f:
@@ -27,7 +27,12 @@ def inference_single_image(model, image_path, device, transform):
     model.eval()
     with torch.no_grad():
         age_out, gender_out = model(img_tensor)  # age_out: [1], gender_out: [1, 2]
-        predicted_age = age_out.item()
+        if isinstance(model, MultiTaskModel_KLD):
+            age_classes=[10, 20, 30, 40, 50]
+            predicted_age = age_classes[torch.argmax(age_out, dim=1).item()]
+        else:
+            predicted_age = age_out.item()
+        
         gender_probs = torch.softmax(gender_out, dim=1)
         predicted_gender = torch.argmax(gender_probs, dim=1).item()  # 0=남, 1=여
     return predicted_age, predicted_gender
@@ -42,11 +47,14 @@ def main(config_path='config.yaml'):
     image_size = config['dataset']['image_size']
     test_image_dir = config['test']['image_dir']
     checkpoint_path = config['checkpoint']['path']
-    
+    dataset_name = config['dataset']['name']
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 모델 생성 및 로드
-    model = MultiTaskModel(backbone_name=model_name)
+    if dataset_name == 'HS_FADGaussianDataset':
+        model = MultiTaskModel_KLD(backbone_name=model_name)
+    else:
+        model = MultiTaskModel(backbone_name=model_name)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.to(device)
     
@@ -55,10 +63,17 @@ def main(config_path='config.yaml'):
     
     for image_path in tqdm(glob(os.path.join(test_image_dir, '*.*'))):
         predicted_age, predicted_gender = inference_single_image(model, image_path, device, transform)
-        predicted_age = denormalize_age(predicted_age)
+        if isinstance(model, MultiTaskModel):
+            predicted_age = denormalize_age(predicted_age)
         
         gender_str = 'Male' if predicted_gender == 0 else 'Female'
         print(f"Inference result - {image_path} Age: {predicted_age:.2f}, Gender: {gender_str}")
 
+    
 if __name__ == '__main__':
-    main('config_hsfad.yaml')
+    from argparse import ArgumentParser
+    parser = ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='Path to the configuration file')
+    args = parser.parse_args()
+    
+    main(args.config)

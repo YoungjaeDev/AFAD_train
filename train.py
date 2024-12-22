@@ -8,9 +8,15 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 import wandb
 
-from dataset import AFADDataset, HS_FADDataset, CombinedAgeDataset
-from model import MultiTaskModel
+from dataset import AFADDataset, HS_FADDataset, CombinedAgeDataset, HS_FADGaussianDataset
+from model import MultiTaskModel, MultiTaskModel_KLD, AgeModel, GenderModel
 from loss import WeightedMSELoss
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 # DataLoader 생성 부분을 다음과 같이 수정
 def get_balanced_sampler(dataset):
@@ -25,9 +31,11 @@ def get_balanced_sampler(dataset):
     
     # 각 클래스의 weight 계산 (적은 샘플을 가진 클래스에 더 높은 가중치)
     weights = 1. / class_counts
-    
+
     # 각 샘플에 대한 weight 할당
     sample_weights = weights[age_labels]
+    
+    logger.info(f"Class counts: {class_counts} | Class weights: {weights} | Sample weights: {sample_weights}")
     
     # WeightedRandomSampler 생성
     sampler = WeightedRandomSampler(
@@ -46,6 +54,9 @@ def main(config_path='config.yaml'):
         cfg = yaml.safe_load(f)
     
     model_name = cfg['model']['name']
+    # 모델 타입 확인
+    model_type = cfg['model'].get('type', 'multitask')  # 기본값은 multitask
+    
     epochs = cfg['training']['epochs']
     batch_size = cfg['training']['batch_size']
     lr = cfg['training']['lr']
@@ -134,6 +145,19 @@ def main(config_path='config.yaml'):
             split='val',
             val_split=val_split
         )
+    elif dataset_name == 'HS_FADGaussianDataset':
+        train_dataset = HS_FADGaussianDataset(
+            root_dir=root_dir,
+            transform=train_transform,
+            split='train',
+            val_split=val_split
+        )
+        val_dataset = HS_FADGaussianDataset(
+            root_dir=root_dir,
+            transform=val_transform,
+            split='val',
+            val_split=val_split
+        )
     else:
         raise ValueError(f"Invalid dataset name: {dataset_name}")
     
@@ -150,48 +174,40 @@ def main(config_path='config.yaml'):
     # -------------------
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model = MultiTaskModel(backbone_name=model_name)
+    if model_type == 'age_only':
+        model = AgeModel(backbone_name=model_name)
+    elif model_type == 'gender_only':
+        model = GenderModel(backbone_name=model_name)
+    else:
+        if dataset_name == 'HS_FADGaussianDataset':
+            model = MultiTaskModel_KLD(backbone_name=model_name)
+        else:
+            model = MultiTaskModel(backbone_name=model_name)
+    
     model = torch.nn.DataParallel(model)  # 간단한 GPU 병렬화
     model.to(device)
     
     # 나이(분류) -> MSE, 성별(분류) -> CrossEntropyLoss
-    # criterion_age = nn.MSELoss()
-    criterion_age = WeightedMSELoss()
-    criterion_gender = nn.CrossEntropyLoss()
+    # Loss function 설정
+    if dataset_name == 'HS_FADGaussianDataset':
+        criterion_age = nn.KLDivLoss(reduction='batchmean')
+    else:
+        criterion_age = WeightedMSELoss()
     
+    # Loss function 설정
+    if model_type == 'gender_only':
+        criterion = nn.CrossEntropyLoss()
+    elif dataset_name == 'HS_FADGaussianDataset':
+        criterion_age = nn.KLDivLoss(reduction='batchmean')
+        if model_type != 'age_only':
+            criterion_gender = nn.CrossEntropyLoss()
+    else:
+        criterion_age = WeightedMSELoss()
+        if model_type != 'age_only':
+            criterion_gender = nn.CrossEntropyLoss()
+
     optimizer = optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
     
-    # 스케쥴러...
-    # 1. CosineAnnealingLR: 주기적으로 lr을 조정
-    # scheduler = optim.lr_scheduler.CosineAnnealingLR(
-    #     optimizer, 
-    #     T_max=epochs,  # 한 주기의 길이
-    #     eta_min=1e-6   # 최소 lr
-    # )
-
-    # # 2. ReduceLROnPlateau: validation loss가 개선되지 않을 때 lr 감소
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    #     optimizer,
-    #     mode='min',
-    #     factor=0.1,    # lr 감소 비율
-    #     patience=3,    # 몇 epoch 동안 개선이 없을 때 감소시킬지
-    #     min_lr=1e-6
-    # )
-
-    # # 3. OneCycleLR: 처음에 lr을 증가시켰다가 점차 감소
-    # scheduler = optim.lr_scheduler.OneCycleLR(
-    #     optimizer,
-    #     max_lr=lr,     # 최대 lr
-    #     epochs=epochs,
-    #     steps_per_epoch=len(train_loader)
-    # )
-
-    # ReduceLROnPlateau의 경우
-    # scheduler.step(val_loss)  # validation 후
-
-    # # 다른 스케줄러들
-    # scheduler.step()  # epoch 끝날 때
-
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -215,24 +231,45 @@ def main(config_path='config.yaml'):
         model.train()
         running_loss = 0.0
         
-        for step, (images, age, gender, weight) in enumerate(train_loader):
-            images = images.to(device)
-            age = age.float().to(device)
-            gender = gender.long().to(device)
-            weight = weight.to(device)
+        for step, batch in enumerate(train_loader):
+           
+            if dataset_name == 'CombinedAgeDataset':
+                images, age, gender = batch
+            else:
+                images, age, gender, weight = batch
+            
+            if model_type == 'gender_only':
+                gender = gender.long().to(device)
+            elif model_type == 'age_only':
+                age = age.float().to(device)
+                weight = weight.to(device)
+            else:
+                age = age.float().to(device)
+                gender = gender.long().to(device)
+                weight = weight.to(device)
             
             optimizer.zero_grad()
-            age_out, gender_out = model(images)
             
-            loss_age = criterion_age(age_out, age, weight) * age_loss_weight
-            loss_gender = criterion_gender(gender_out, gender)
-            # loss = loss_age + loss_gender
-            loss = loss_age + loss_gender
+            if model_type == 'gender_only':
+                gender_out = model(images)
+                loss = criterion(gender_out, gender)
+            elif model_type == 'age_only':
+                age_out = model(images)
+                if isinstance(criterion_age, nn.KLDivLoss):
+                    loss = criterion_age(age_out, age)
+                else:
+                    loss = criterion_age(age_out, age, weight)
+            else:
+                age_out, gender_out = model(images)
+                if isinstance(criterion_age, nn.KLDivLoss):
+                    loss_age = criterion_age(age_out, age) * age_loss_weight
+                else:
+                    loss_age = criterion_age(age_out, age, weight) * age_loss_weight
+                loss_gender = criterion_gender(gender_out, gender)
+                loss = loss_age + loss_gender
             
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             
             running_loss += loss.item()
@@ -240,14 +277,28 @@ def main(config_path='config.yaml'):
             
             if (step + 1) % log_interval == 0:
                 avg_loss = running_loss / log_interval
-                print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Loss: {avg_loss:.4f} | Age Loss: {loss_age.item():.4f} | Gender Loss: {loss_gender.item():.4f}")
-                
-                if use_wandb:
-                    wandb.log({
-                        'train_loss': avg_loss,
-                        'train_loss_age': loss_age.item(),
-                        'train_loss_gender': loss_gender.item(),
-                        'epoch': epoch+1
+                if model_type == 'gender_only':
+                    print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Gender Loss: {avg_loss:.4f}")
+                    if use_wandb:
+                        wandb.log({
+                            'train_loss': avg_loss,
+                            'epoch': epoch+1
+                        }, step=global_step)
+                elif model_type == 'age_only':
+                    print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Loss: {avg_loss:.4f}")
+                    if use_wandb:
+                        wandb.log({
+                            'train_loss': avg_loss,
+                            'epoch': epoch+1
+                        }, step=global_step)
+                else:
+                    print(f"[Epoch {epoch+1}/{epochs}] Step {step+1}/{len(train_loader)} | Loss: {avg_loss:.4f} | Age Loss: {loss_age.item():.4f} | Gender Loss: {loss_gender.item():.4f}")
+                    if use_wandb:
+                        wandb.log({
+                            'train_loss': avg_loss,
+                            'train_loss_age': loss_age.item(),
+                            'train_loss_gender': loss_gender.item(),
+                            'epoch': epoch+1
                     }, step=global_step)
                 
                 running_loss = 0.0
@@ -255,19 +306,44 @@ def main(config_path='config.yaml'):
         # -------------------
         # Validation
         # -------------------
-        val_loss, val_loss_age, val_loss_gender, val_acc_gender = validate(model, val_loader, criterion_age, criterion_gender, device, age_loss_weight)
         
-        print(f"=== Validation Epoch {epoch+1}/{epochs} ===")
-        print(f"Val Loss: {val_loss:.4f} | Age Loss: {val_loss_age:.4f} | Gender Loss: {val_loss_gender:.4f} | Gender Acc: {val_acc_gender:.4f}")
+        # Validation 수정
+        if model_type == 'gender_only':
+            val_loss, val_acc = validate_gender_only(model, val_loader, dataset_name, criterion, device)
+            print(f"=== Validation Epoch {epoch+1}/{epochs} ===")
+            print(f"Val Loss: {val_loss:.4f} | Gender Acc: {val_acc:.4f}")
+            
+            if use_wandb:
+                wandb.log({
+                    'val_loss': val_loss,
+                    'val_acc_gender': val_acc,  # 성별 분류 정확도
+                    'epoch': epoch+1
+                }, step=global_step)
+        elif model_type == 'age_only':
+            val_loss = validate_age_only(model, val_loader, criterion_age, device)
+            print(f"=== Validation Epoch {epoch+1}/{epochs} ===")
+            print(f"Val Loss: {val_loss:.4f}")
+            
+            if use_wandb:
+                wandb.log({
+                    'val_loss': val_loss,
+                    'epoch': epoch+1
+                }, step=global_step)
+        else:
+            
+            val_loss, val_loss_age, val_loss_gender, val_acc_gender = validate(model, val_loader, criterion_age, criterion_gender, device, age_loss_weight)
+            
+            print(f"=== Validation Epoch {epoch+1}/{epochs} ===")
+            print(f"Val Loss: {val_loss:.4f} | Age Loss: {val_loss_age:.4f} | Gender Loss: {val_loss_gender:.4f} | Gender Acc: {val_acc_gender:.4f}")
 
-        if use_wandb:
-            wandb.log({
-                'val_loss': val_loss,
-                'val_loss_age': val_loss_age,
-                'val_loss_gender': val_loss_gender,
-                'val_acc_gender': val_acc_gender,
-                'epoch': epoch+1
-            }, step=global_step)
+            if use_wandb:
+                wandb.log({
+                    'val_loss': val_loss,
+                    'val_loss_age': val_loss_age,
+                    'val_loss_gender': val_loss_gender,
+                    'val_acc_gender': val_acc_gender,
+                    'epoch': epoch+1
+                }, step=global_step)
         
         # -------------------
         # 모델 저장 (best 모델)
@@ -278,6 +354,13 @@ def main(config_path='config.yaml'):
             torch.save(model.module.state_dict(), save_path)
             print(f"Best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
 
+        # -------------------
+        # 모델 저장 (epoch 모델)
+        # -------------------
+        save_path = os.path.join(save_dir, f"model_epoch_{epoch+1}.pth")
+        torch.save(model.module.state_dict(), save_path)
+        print(f"Model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
+        
         # epoch 끝날 때마다 scheduler step
         scheduler.step(val_loss)
 
@@ -288,6 +371,54 @@ def main(config_path='config.yaml'):
 
     if use_wandb:
         wandb.finish()
+
+def validate_age_only(model, val_loader, criterion_age, device):
+    model.eval()
+    val_loss = 0.0
+    
+    with torch.no_grad():
+        for images, age, _, weight in val_loader:
+            images = images.to(device)
+            age = age.float().to(device)
+            weight = weight.to(device)
+            
+            age_out = model(images)
+            
+            if isinstance(criterion_age, nn.KLDivLoss):
+                loss = criterion_age(age_out, age)
+            else:
+                loss = criterion_age(age_out, age, weight)
+            
+            val_loss += loss.item()
+    
+    return val_loss / len(val_loader)
+
+def validate_gender_only(model, val_loader, dataset_name, criterion, device):
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            if dataset_name == 'CombinedAgeDataset':
+                images, _, gender = batch
+            else:
+                images, _, gender, _ = batch
+                
+            images = images.to(device)
+            gender = gender.long().to(device)
+            
+            gender_out = model(images)
+            loss = criterion(gender_out, gender)
+            
+            val_loss += loss.item()
+            
+            _, predicted = torch.max(gender_out, 1)
+            total += gender.size(0)
+            correct += (predicted == gender).sum().item()
+    
+    return val_loss / len(val_loader), correct / total
 
 def validate(model, val_loader, criterion_age, criterion_gender, device, age_loss_weight):
     model.eval()
@@ -305,8 +436,16 @@ def validate(model, val_loader, criterion_age, criterion_gender, device, age_los
             weight = weight.to(device)
             
             age_out, gender_out = model(images)
+
+            # KL Divergence의 경우 log_softmax 적용 필요
+            if isinstance(criterion_age, nn.KLDivLoss):
+                age_out = torch.log_softmax(age_out, dim=1)
             
-            loss_age = criterion_age(age_out, age, weight) * age_loss_weight
+            if isinstance(criterion_age, nn.KLDivLoss):
+                loss_age = criterion_age(age_out, age) * age_loss_weight
+            else:
+                loss_age = criterion_age(age_out, age, weight) * age_loss_weight
+                
             loss_gender = criterion_gender(gender_out, gender)
             loss = loss_age + loss_gender
             
@@ -325,7 +464,12 @@ def validate(model, val_loader, criterion_age, criterion_gender, device, age_los
     val_acc_gender = correct_gender / total_samples
     
     return val_loss, val_loss_age, val_loss_gender, val_acc_gender
-        
 
+    
 if __name__ == '__main__':
-    main('config_hsfad.yaml')
+    from argparse import ArgumentParser
+    parser = ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='Path to the configuration file')
+    args = parser.parse_args()
+    
+    main(args.config)
