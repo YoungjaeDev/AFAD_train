@@ -12,9 +12,11 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
+import numpy as np
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class AFADDataset(Dataset):
     def __init__(self, root_dir, transform=None, split='train', val_split=0.2, seed=42):
@@ -214,8 +216,8 @@ class HS_FADDataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         
-        # 가중치가 적용된 정규화된 나이
-        normalized_age = (float(age) - 10) / 40.0
+        # 나이를 1-59 범위로 정규화 (기존 10-50 대신)
+        normalized_age = (float(age) - 1) / 58.0  # 1-59세 범위를 0-1로 정규화
         
         # 가중치는 loss 계산을 위해 함께 반환
         weight = self.age_weights[age]
@@ -223,18 +225,121 @@ class HS_FADDataset(Dataset):
         return image, normalized_age, gender, weight
 
     @staticmethod
-    def denormalize_age(weighted_age, age_weight):
-        """가중치가 적용된 나이값을 원래 스케일로 변환"""
-        normalized_age = weighted_age / age_weight
-        return normalized_age * 40.0 + 10
+    def denormalize_age(normalized_age):
+        """정규화된 나이값을 원래 스케일로 변환"""
+        return normalized_age * 58.0 + 1
+
+
+class HS_FADGaussianDataset(Dataset):
+    def __init__(self, root_dir, age_classes=[10, 20, 30, 40, 50], sigma=5, transform=None, split='train', val_split=0.2, seed=42):
+        self.root_dir = root_dir
+        self.age_classes = age_classes  # 가능한 나이 클래스
+        self.sigma = sigma              # Gaussian 분포의 표준편차
+        self.transform = transform
+        
+        # 모든 이미지 경로 수집
+        all_image_paths = glob.glob(os.path.join(root_dir, '*', '*', '*.jpg'))
+        
+        # 이미지를 그룹으로 묶기 (같은 인물의 이미지들)
+        image_groups = {}
+        for img_path in all_image_paths:
+            filename = os.path.basename(img_path)
+            group_id = '_'.join(filename.split('_')[:-1])
+            
+            if group_id not in image_groups:
+                image_groups[group_id] = []
+            image_groups[group_id].append(img_path)
+        
+        # 각 그룹의 이미지들을 처리
+        self.samples = []
+        age_counts = {}  # 나이별 카운트를 위한 딕셔너리
+        
+        for group_paths in image_groups.values():
+            group_samples = []
+            for img_path in group_paths:
+                parts = img_path.split(os.sep)
+                age = int(parts[-3])
+                gender_str = parts[-2]
+                
+                # 나이 카운트 업데이트
+                if age not in age_counts:
+                    age_counts[age] = 0
+                age_counts[age] += 1
+                
+                gender = 0 if gender_str == '111' else 1
+                group_samples.append((img_path, age, gender))
+            
+            self.samples.append(group_samples)
+        
+        # 나이별 가중치 계산 (샘플 수의 역수를 기반으로)
+        max_count = max(age_counts.values())
+        self.age_weights = {
+            age: max_count / count 
+            for age, count in age_counts.items()
+        }
+        
+        logger.info(f"Age weights: {self.age_weights}")
+        
+        # 그룹 단위로 셔플
+        random.seed(seed)
+        random.shuffle(self.samples)
+        
+        # train/val 분할
+        val_size = int(len(self.samples) * val_split)
+        if split == 'train':
+            self.samples = self.samples[val_size:]
+        else:  # 'val'
+            self.samples = self.samples[:val_size]
+        
+        # 그룹을 다시 개별 샘플로 평탄화
+        self.samples = [sample for group in self.samples for sample in group]
+        
+
+    def __len__(self):
+        return len(self.samples)
+
+
+    def __getitem__(self, idx):
+        img_path, age, gender = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform is not None:
+            image = self.transform(image)
+        
+        # Gaussian 분포 라벨 생성
+        age_distribution = self.generate_age_distribution(age)
+
+        # 가중치는 loss 계산을 위해 함께 반환
+        weight = self.age_weights[age]
+        
+        return image, age_distribution, gender, weight
     
-    
-class CombinedAgeDataset(Dataset):
+
+    def generate_age_distribution(self, age):
+        """
+        주어진 나이를 기반으로 Gaussian 분포를 생성합니다.
+
+        Args:
+            age (int): 실제 나이 라벨
+
+        Returns:
+            torch.Tensor: Gaussian 분포 형태의 라벨 벡터
+            
+        if age == 30:
+            tensor([1.1983e-08, 2.6393e-04, 1.0648e-01, 7.8678e-01, 1.0648e-01])
+        """
+        distribution = np.exp(-0.5 * ((np.array(self.age_classes) - age) / self.sigma) ** 2)
+        distribution /= distribution.sum()  # 정규화
+        return torch.tensor(distribution, dtype=torch.float32)
+
+
+# AFAD랑 HS-FAD 데이터를 합친 데이터셋
+class CombinedDataset(Dataset):
     def __init__(self, afad_root_dir, hsfad_root_dir, transform=None, split='train', val_split=0.2, seed=42, 
                  max_samples_per_age={
-                     10: 10000,
-                     20: 10000,
-                     30: 10000,
+                     10: -1,
+                     20: -1,
+                     30: -1,
                      40: -1,
                      50: -1
                  }):
