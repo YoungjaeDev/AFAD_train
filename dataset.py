@@ -13,8 +13,10 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as T
 import numpy as np
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class AFADDataset(Dataset):
     def __init__(self, root_dir, transform=None, split='train', val_split=0.2, seed=42):
@@ -331,12 +333,13 @@ class HS_FADGaussianDataset(Dataset):
         return torch.tensor(distribution, dtype=torch.float32)
 
 
-class CombinedAgeDataset(Dataset):
+# AFAD랑 HS-FAD 데이터를 합친 데이터셋
+class CombinedDataset(Dataset):
     def __init__(self, afad_root_dir, hsfad_root_dir, transform=None, split='train', val_split=0.2, seed=42, 
                  max_samples_per_age={
-                     10: 10000,
-                     20: 10000,
-                     30: 10000,
+                     10: -1,
+                     20: -1,
+                     30: -1,
                      40: -1,
                      50: -1
                  }):

@@ -1,3 +1,18 @@
+"""
+딥러닝 기반 나이 및 성별 예측 모델 학습 프로그램
+
+동작 순서:
+1. 설정 파일(config.yaml)에서 학습 파라미터 로드
+2. 데이터셋 및 데이터로더 생성
+3. 모델 초기화 (MultiTask/Age-only/Gender-only)
+4. 손실 함수 및 옵티마이저 설정
+5. 학습 루프 실행
+   - 학습 데이터로 모델 학습
+   - 검증 데이터로 성능 평가
+   - 최적 모델 저장
+   - wandb로 학습 과정 모니터링
+"""
+
 import os
 import yaml
 import numpy as np
@@ -9,7 +24,7 @@ from torchvision import transforms
 import wandb
 
 from dataset import AFADDataset, HS_FADDataset, CombinedDataset, HS_FADGaussianDataset
-from model import MultiTaskModel, MultiTaskModel_KLD, AgeModel, GenderModel
+from model import MultiTaskModel_KLD, AgeModel, GenderModel
 from loss import WeightedMSELoss
 
 import logging
@@ -19,25 +34,36 @@ logger = logging.getLogger(__name__)
 
 
 # DataLoader 생성 부분을 다음과 같이 수정
-def get_balanced_sampler(dataset):
+def get_balanced_sampler(dataset, power=0.3):
     """
-    각 나이 클래스에 대한 WeightedRandomSampler를 생성
+    데이터셋의 클래스 불균형을 해소하기 위한 샘플러 생성
+    power: 가중치 조정 강도 (0~1)
+        - 1: 완전한 균형 (기존 방식)
+        - 0: 원본 분포 유지
+        - 0.5: 중간 정도의 균형
     """
-    # 각 샘플의 나이 클래스 수집
-    age_labels = [sample[1] for sample in dataset.samples]  # [1]은 age_class
+    age_to_idx = {age: idx for idx, age in enumerate(dataset.age_classes)}
+    age_labels = [age_to_idx[sample[1]] for sample in dataset.samples]
     
     # 각 클래스별 샘플 개수 계산
     class_counts = np.bincount(age_labels)
     
-    # 각 클래스의 weight 계산 (적은 샘플을 가진 클래스에 더 높은 가중치)
-    weights = 1. / class_counts
-
+    # 최대 샘플 수를 기준으로 가중치 계산 (부드러운 버전)
+    max_count = max(class_counts)
+    
+    # numpy의 power 함수 사용하여 가중치를 부드럽게 조정
+    weights = (max_count / class_counts) ** power
+    
+    # # 가중치 정규화 (선택사항)
+    # weights = weights / weights.mean()  # 평균이 1이 되도록 정규화
+    
     # 각 샘플에 대한 weight 할당
     sample_weights = weights[age_labels]
     
-    logger.info(f"Class counts: {class_counts} | Class weights: {weights} | Sample weights: {sample_weights}")
+    logger.info(f"Age classes: {dataset.age_classes}")
+    logger.info(f"Class counts: {class_counts}")
+    logger.info(f"Smoothed class weights (power={power}): {weights}")
     
-    # WeightedRandomSampler 생성
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(dataset),
@@ -47,6 +73,10 @@ def get_balanced_sampler(dataset):
     return sampler
 
 class DatasetFactory:
+    """
+    데이터셋 생성을 위한 팩토리 클래스
+    AFAD, HS-FAD 등 다양한 데이터셋을 동일한 인터페이스로 생성
+    """
     @staticmethod
     def create_dataset(dataset_name, root_dir, transform, split, val_split):
         dataset_map = {
@@ -78,18 +108,30 @@ class DatasetFactory:
             )
 
 class ModelFactory:
+    """
+    모델 생성을 위한 팩토리 클래스
+    단일 작업(나이/성별) 또는 다중 작업 모델을 생성
+    """
     @staticmethod
     def create_model(model_type, model_name, dataset_name):
         if model_type == 'age_only':
+            logger.info(f"Creating AgeModel with backbone: {model_name}")
             return AgeModel(backbone_name=model_name)
         elif model_type == 'gender_only':
+            logger.info(f"Creating GenderModel with backbone: {model_name}")
             return GenderModel(backbone_name=model_name)
         else:
             if dataset_name == 'HS_FADGaussianDataset':
+                logger.info(f"Creating MultiTaskModel_KLD with backbone: {model_name}")
                 return MultiTaskModel_KLD(backbone_name=model_name)
-            return MultiTaskModel(backbone_name=model_name)
+            
+            raise ValueError(f"Invalid dataset name: {dataset_name}")
 
 class Validator:
+    """
+    모델 검증을 위한 클래스
+    나이 예측, 성별 예측, 또는 둘 다를 검증
+    """
     def __init__(self, model, criterion_age, criterion_gender, device, age_loss_weight=1.0):
         self.model = model
         self.criterion_age = criterion_age
@@ -108,6 +150,8 @@ class Validator:
 
     def _validate_age_only(self, val_loader):
         val_loss = 0.0
+        age_losses_sum = {age: 0.0 for age in val_loader.dataset.age_classes}
+        age_counts = {age: 0 for age in val_loader.dataset.age_classes}
         
         with torch.no_grad():
             for images, age, _, weight in val_loader:
@@ -118,11 +162,43 @@ class Validator:
                 age_out = self.model(images)
                 loss = self._compute_age_loss(age_out, age, weight)
                 val_loss += loss.item()
+                
+                # 나이대별 loss 계산
+                age_numpy = age.cpu().numpy()
+                age_out_numpy = age_out.cpu().numpy()
+                
+                for idx in range(len(age_numpy)):
+                    # 실제 나이 클래스 (가장 높은 확률을 가진 클래스)
+                    true_age_idx = np.argmax(age_numpy[idx])
+                    true_age = val_loader.dataset.age_classes[true_age_idx]
+                    
+                    individual_loss = self._compute_age_loss(
+                        age_out[idx:idx+1], 
+                        age[idx:idx+1], 
+                        weight[idx:idx+1]
+                    ).item()
+                    
+                    age_losses_sum[true_age] += individual_loss
+                    age_counts[true_age] += 1
         
-        return val_loss / len(val_loader)
+        # 각 나이대별 평균 loss 계산
+        age_specific_losses = {
+            age: losses_sum / counts if counts > 0 else 0.0
+            for age, (losses_sum, counts) in zip(age_losses_sum.keys(), 
+                                            zip(age_losses_sum.values(), 
+                                                age_counts.values()))
+        }
+        # 로깅
+        logger.info("Age-specific validation losses:")
+        for age, loss in age_specific_losses.items():
+            logger.info(f"Age {age}: {loss:.4f}")
+        
+        return val_loss / len(val_loader), age_specific_losses
 
     def _validate_gender_only(self, val_loader):
         val_loss = 0.0
+        correct = 0
+        total = 0
         
         with torch.no_grad():
             for images, _, gender, _ in val_loader:
@@ -132,11 +208,20 @@ class Validator:
                 gender_out = self.model(images)
                 loss = self.criterion_gender(gender_out, gender)
                 val_loss += loss.item()
+                
+                # 정확도 계산
+                _, predicted = torch.max(gender_out.data, 1)
+                total += gender.size(0)
+                correct += (predicted == gender).sum().item()
         
-        return val_loss / len(val_loader)
+        accuracy = 100 * correct / total
+        logger.info(f'Gender Prediction Accuracy: {accuracy:.2f}%')
+        return val_loss / len(val_loader), accuracy
 
     def _validate_multitask(self, val_loader):
         val_loss = 0.0
+        correct = 0
+        total = 0
         
         with torch.no_grad():
             for images, age, gender, weight in val_loader:
@@ -151,8 +236,15 @@ class Validator:
                 
                 loss = self.age_loss_weight * age_loss + gender_loss
                 val_loss += loss.item()
+                
+                # 성별 예측 정확도 계산
+                _, predicted = torch.max(gender_out.data, 1)
+                total += gender.size(0)
+                correct += (predicted == gender).sum().item()
         
-        return val_loss / len(val_loader)
+        accuracy = 100 * correct / total
+        logger.info(f'Gender Prediction Accuracy: {accuracy:.2f}%')
+        return val_loss / len(val_loader), accuracy
 
     def _compute_age_loss(self, age_out, age, weight):
         if isinstance(self.criterion_age, nn.KLDivLoss):
@@ -161,6 +253,14 @@ class Validator:
 
 
 def create_train_transform(image_size):
+    """
+    학습용 데이터 증강 및 전처리 파이프라인 생성
+    - 크기 조정
+    - 무작위 좌우 반전
+    - 회전
+    - 색상 변형
+    - 정규화
+    """
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(),
@@ -172,6 +272,11 @@ def create_train_transform(image_size):
     ])
 
 def create_val_transform(image_size):
+    """
+    검증용 데이터 전처리 파이프라인 생성
+    - 크기 조정
+    - 정규화
+    """
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -180,7 +285,11 @@ def create_val_transform(image_size):
     ])
 
 def create_train_loader(dataset, cfg):
-    if cfg['training'].get('use_balanced_sampler', False):
+    """
+    학습용 데이터로더 생성
+    클래스 불균형 해소를 위한 샘플러 옵션 포함
+    """
+    if cfg['dataset'].get('balanced_sampler', False):
         sampler = get_balanced_sampler(dataset)
         shuffle = False
     else:
@@ -197,6 +306,9 @@ def create_train_loader(dataset, cfg):
     )
 
 def create_val_loader(dataset, cfg):
+    """
+    검증용 데이터로더 생성
+    """
     return DataLoader(
         dataset,
         batch_size=cfg['training']['batch_size'],
@@ -206,6 +318,10 @@ def create_val_loader(dataset, cfg):
     )
     
 def main(config_path='config.yaml'):
+    """
+    메인 학습 함수
+    전체적인 학습 과정을 조율
+    """
     # Load config
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
@@ -243,19 +359,34 @@ def main(config_path='config.yaml'):
         cfg['model']['name'],
         cfg['dataset']['name']
     )
+    model = torch.nn.DataParallel(model)
+    model.to(device)
     
      # Create loss functions
     if cfg['dataset']['name'] == 'HS_FADGaussianDataset':
+        logger.info("Using KLDivLoss for age prediction")
         criterion_age = nn.KLDivLoss(reduction='batchmean')
     else:
+        logger.info("Using WeightedMSELoss for age prediction")
         criterion_age = WeightedMSELoss()
+    logger.info("Using CrossEntropyLoss for gender prediction")
     criterion_gender = nn.CrossEntropyLoss()
     
     # Create optimizer
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(),
-        lr=cfg['training']['learning_rate'],
+        lr=cfg['training']['lr'],
         weight_decay=cfg['training'].get('weight_decay', 0)
+    )
+    
+    # Create learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,      # 학습률을 절반으로 감소
+        patience=2,      # 2 epoch 동안 개선이 없으면 lr 감소
+        min_lr=1e-8,     # 최소 학습률
+        verbose=True     # 학습률 변경 시 출력
     )
     
     # Create validator
@@ -268,9 +399,12 @@ def main(config_path='config.yaml'):
     )
     
     # Initialize wandb
-    if cfg.get('wandb', {}).get('use_wandb', False):
+    wandb_cfg = cfg.get('logging', {})
+    if wandb_cfg.get('use_wandb', False):
         wandb.init(
-            project=cfg['wandb']['project_name'],
+            project=wandb_cfg['project'],
+            entity=wandb_cfg['entity'],
+            name=wandb_cfg['run_name'],
             config=cfg
         )
     
@@ -295,7 +429,7 @@ def main(config_path='config.yaml'):
                 loss = cfg['training'].get('age_loss_weight', 1.0) * age_loss + gender_loss
             elif cfg['model'].get('type') == 'age_only':
                 age_out = model(images)
-                loss = criterion_age(age_out, age, weight)
+                loss = criterion_age(age_out, age)
             else:  # gender_only
                 gender_out = model(images)
                 loss = criterion_gender(gender_out, gender)
@@ -310,23 +444,51 @@ def main(config_path='config.yaml'):
                           f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
         
         # Validation
-        val_loss = validator.validate(val_loader, cfg['model'].get('type', 'multitask'))
+        val_results = validator.validate(val_loader, cfg['model'].get('type', 'multitask'))
         
-        # Logging
-        if cfg.get('wandb', {}).get('use_wandb', False):
-            wandb.log({
-                'train_loss': train_loss / len(train_loader),
-                'val_loss': val_loss,
-                'epoch': epoch
-            })
+        if cfg['model'].get('type') == 'age_only':
+            val_loss, age_losses = val_results
+            if wandb_cfg.get('use_wandb', False):
+                wandb.log({
+                    'train_loss': train_loss / len(train_loader),
+                    'val_loss': val_loss,
+                    'epoch': epoch,
+                    **{f"val_loss_age_{age}": loss for age, loss in age_losses.items()}
+                })
+                logger.info(f'Epoch {epoch} - Train Loss: {train_loss / len(train_loader):.6f} - Val Loss: {val_loss:.6f}')
         
+        else:  # gender_only 또는 multitask
+            val_loss, gender_accuracy = val_results
+            if wandb_cfg.get('use_wandb', False):
+                wandb.log({
+                    'train_loss': train_loss / len(train_loader),
+                    'val_loss': val_loss,
+                    'gender_accuracy': gender_accuracy,
+                    'epoch': epoch
+                })
+                logger.info(f'Epoch {epoch} - Train Loss: {train_loss / len(train_loader):.6f} - Val Loss: {val_loss:.6f} - Gender Accuracy: {gender_accuracy:.2f}%')
+            
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), cfg['training']['save_path'])
+            save_path = os.path.join(cfg['training']['save_dir'], wandb_cfg['run_name'], f"best_model_epoch_{epoch}.pth")
+            
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            torch.save(model.module.state_dict(), save_path)
             logger.info(f'Saved best model with validation loss: {val_loss:.6f}')
 
+        scheduler.step(val_loss)
+    
+    if wandb_cfg.get('use_wandb', False):
+        wandb.finish()
+
 if __name__ == '__main__':
+    """
+    프로그램 시작점
+    설정 파일 경로를 인자로 받아 학습 시작
+    """
+    
     from argparse import ArgumentParser
     parser = ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to the configuration file')
